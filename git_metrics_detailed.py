@@ -4,40 +4,45 @@ import csv
 import json
 import sys
 import requests
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 # Constants
 API_URL = "https://api.github.com/graphql"
+REST_API_URL = "https://api.github.com"
 
 def main():
     """Main function to process GitHub contribution metrics with categories"""
     
     # Capture command line arguments
-    if len(sys.argv) != 6:
-        print("Usage: python script.py <access_token> <start_date> <end_date> <input_csv> <output_csv>")
+    if len(sys.argv) < 6 or len(sys.argv) > 7:
+        print("Usage: python script.py <access_token> <organization_name> <start_date> <end_date> <output_csv> [email_domain]")
+        print("Example: python script.py ghp_xxxx my-org 2024-01-01 2024-12-31 results.csv")
+        print("Example with email domain: python script.py ghp_xxxx my-org 2024-01-01 2024-12-31 results.csv sharechat.com")
         sys.exit(1)
     
     access_token = sys.argv[1]
-    start_date = sys.argv[2]
-    end_date = sys.argv[3]
-    file_path_with_git_handles = sys.argv[4]
+    organization_name = sys.argv[2]
+    start_date = sys.argv[3]
+    end_date = sys.argv[4]
     file_path_for_results = sys.argv[5]
+    email_domain = sys.argv[6] if len(sys.argv) == 7 else None
     
-    # Read the CSV file with GitHub handles
-    try:
-        with open(file_path_with_git_handles, 'r', newline='', encoding='utf-8') as file:
-            reader = csv.reader(file)
-            records = list(reader)
-            # Skip the header row (first row)
-            if records:
-                records = records[1:]
-    except FileNotFoundError:
-        print(f"Error: Could not find CSV file at {file_path_with_git_handles}")
-        return
-    except Exception as e:
-        print(f"Error reading CSV file: {e}")
-        return
+    print(f"Fetching members from organization: {organization_name}")
+    
+    # Fetch organization members with SAML identities from GitHub API
+    org_members = get_organization_members_with_saml(organization_name, access_token)
+    
+    if not org_members:
+        print(f"Error: No members found for organization '{organization_name}'")
+        print("Please check:")
+        print("  1. Organization name is correct")
+        print("  2. Access token has 'read:org' scope")
+        print("  3. You have access to view organization members")
+        sys.exit(1)
+    
+    print(f"Found {len(org_members)} members in organization '{organization_name}'")
+    print(f"Members: {[member['login'] for member in org_members]}")
     
     # Create and write to results file
     try:
@@ -50,17 +55,30 @@ def main():
             )
             results_file.write(header)
             
-            for row in records:
-                if len(row) < 9:
-                    print(f"Warning: Skipping row with insufficient columns: {row}")
-                    continue
+            for member in org_members:
+                git_handle = member['login']
+                saml_email = member.get('saml_name_id', '')
                 
-                # Extract data from CSV row
-                git_handle = row[0]
-                name = row[1]
-                email = row[8]  # Email is at index 8 (9th column)
+                # Name might already be in member dict from GraphQL, otherwise fetch
+                if 'name' in member and member['name']:
+                    name = member['name']
+                else:
+                    # Get user details to fetch name
+                    user_details = get_user_details(git_handle, access_token)
+                    name = user_details.get('name', git_handle) if user_details else git_handle
                 
-                # Make API call to GitHub
+                # Priority: SAML email (company email) > generated email (if domain provided)
+                if saml_email:
+                    email = saml_email
+                elif email_domain:
+                    email = f"{git_handle}@{email_domain}"
+                    print(f"  Generated email for {git_handle}: {email}")
+                else:
+                    email = ''
+                
+                print(f"\nProcessing user: {git_handle} ({name}) - Email: {email or 'N/A'}")
+                
+                # Make API call to GitHub for contributions
                 try:
                     response_data = get_user_contribution_from_github(
                         git_handle, start_date, end_date, access_token
@@ -73,7 +91,7 @@ def main():
                         
                         contribution_stats = extract_contribution_details(response_data)
                         write_to_file(results_file, name, git_handle, email, contribution_stats)
-                        print_contribution_summary(email, contribution_stats)
+                        print_contribution_summary(git_handle, contribution_stats)
                     else:
                         print(f"Warning: No data received for user {git_handle}")
                         if response_data and 'errors' in response_data:
@@ -85,9 +103,244 @@ def main():
                     print(f"Error getting user contribution for {git_handle}: {e}")
                     empty_stats = create_empty_contribution_stats()
                     write_to_file(results_file, name, git_handle, email, empty_stats)
+            
+            print(f"\n✅ Results written to: {file_path_for_results}")
     
     except Exception as e:
         print(f"Error creating/writing to results file: {e}")
+
+def get_organization_members_with_saml(org_name: str, access_token: str) -> List[Dict[str, Any]]:
+    """
+    Fetch all members of a GitHub organization with SAML identities using GraphQL API
+    
+    Args:
+        org_name: Name of the GitHub organization
+        access_token: GitHub personal access token with 'read:org' and 'admin:org' scope
+    
+    Returns:
+        List of member dictionaries with 'login' and 'saml_name_id' (company email)
+    """
+    
+    print("Fetching organization members with SAML identities via GraphQL...")
+    
+    # GraphQL query to get SAML identities
+    query = """
+    query($login: String!, $cursor: String) {
+      organization(login: $login) {
+        samlIdentityProvider {
+          externalIdentities(first: 100, after: $cursor) {
+            totalCount
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            edges {
+              node {
+                user {
+                  login
+                  name
+                }
+                samlIdentity {
+                  nameId
+                }
+                guid
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    }
+    
+    members_dict = {}
+    cursor = None
+    page = 1
+    
+    while True:
+        variables = {
+            "login": org_name,
+            "cursor": cursor
+        }
+        
+        json_data = {
+            "query": query,
+            "variables": variables
+        }
+        
+        try:
+            response = requests.post(API_URL, json=json_data, headers=headers, timeout=30)
+            
+            if response.status_code == 401:
+                print("Authentication failed. Please check your access token")
+                break
+            elif response.status_code != 200:
+                print(f"Error fetching SAML identities: {response.status_code}")
+                print(f"Response: {response.text}")
+                break
+            
+            data = response.json()
+            
+            # Check for errors
+            if 'errors' in data:
+                print(f"GraphQL errors: {data['errors']}")
+                # Check if it's a SAML not configured error
+                for error in data['errors']:
+                    if 'samlIdentityProvider' in error.get('message', ''):
+                        print("\n⚠️  SAML SSO may not be configured for this organization or you don't have admin:org permission")
+                        print("   Falling back to basic member list without SAML emails...")
+                return get_organization_members_basic(org_name, access_token)
+            
+            # Extract SAML identities
+            org_data = data.get('data', {}).get('organization', {})
+            saml_provider = org_data.get('samlIdentityProvider', {})
+            
+            if not saml_provider:
+                print("\n⚠️  No SAML identity provider found for this organization")
+                print("   Falling back to basic member list without SAML emails...")
+                return get_organization_members_basic(org_name, access_token)
+            
+            external_identities = saml_provider.get('externalIdentities', {})
+            edges = external_identities.get('edges', [])
+            
+            if not edges and page == 1:
+                print("\n⚠️  No SAML identities found (organization may not use SAML SSO)")
+                print("   Falling back to basic member list without SAML emails...")
+                return get_organization_members_basic(org_name, access_token)
+            
+            # Process identities
+            for edge in edges:
+                node = edge.get('node', {})
+                user = node.get('user', {})
+                saml_identity = node.get('samlIdentity', {})
+                
+                if user:
+                    login = user.get('login')
+                    name = user.get('name', login)
+                    saml_name_id = saml_identity.get('nameId', '')
+                    
+                    members_dict[login] = {
+                        'login': login,
+                        'name': name,
+                        'saml_name_id': saml_name_id
+                    }
+                    
+                    if saml_name_id:
+                        print(f"  ✓ {login}: {saml_name_id}")
+            
+            # Check for more pages
+            page_info = external_identities.get('pageInfo', {})
+            if page_info.get('hasNextPage'):
+                cursor = page_info.get('endCursor')
+                page += 1
+                print(f"Fetching page {page}...")
+            else:
+                break
+                
+        except requests.exceptions.RequestException as e:
+            print(f"Error making request to GitHub API: {e}")
+            break
+        except (KeyError, TypeError) as e:
+            print(f"Error parsing response: {e}")
+            print(f"Response: {json.dumps(data, indent=2)}")
+            break
+    
+    members_list = list(members_dict.values())
+    print(f"\n✓ Found {len(members_list)} members with SAML identities")
+    return members_list
+
+def get_organization_members_basic(org_name: str, access_token: str) -> List[Dict[str, Any]]:
+    """
+    Fetch basic organization members list (fallback when SAML is not available)
+    
+    Args:
+        org_name: Name of the GitHub organization
+        access_token: GitHub personal access token with 'read:org' scope
+    
+    Returns:
+        List of member dictionaries with 'login' (no SAML data)
+    """
+    headers = {
+        'Authorization': f'token {access_token}',
+        'Accept': 'application/vnd.github.v3+json'
+    }
+    
+    members = []
+    page = 1
+    
+    print("Fetching basic organization member list...")
+    
+    while True:
+        url = f'{REST_API_URL}/orgs/{org_name}/members'
+        params = {'page': page, 'per_page': 100}
+        
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            
+            if response.status_code == 404:
+                print(f"Organization '{org_name}' not found or you don't have access")
+                break
+            elif response.status_code == 401:
+                print("Authentication failed. Please check your access token")
+                break
+            elif response.status_code != 200:
+                print(f"Error fetching members: {response.status_code}")
+                print(f"Response: {response.text}")
+                break
+            
+            data = response.json()
+            
+            if not data:
+                break
+            
+            # Add saml_name_id as empty for basic members
+            for member in data:
+                member['saml_name_id'] = ''
+                members.append(member)
+            
+            page += 1
+            print(f"  Fetched page {page-1}: {len(data)} members")
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error making request to GitHub API: {e}")
+            break
+    
+    return members
+
+def get_user_details(username: str, access_token: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch user details (name, email, etc.) using REST API
+    
+    Args:
+        username: GitHub username
+        access_token: GitHub personal access token
+    
+    Returns:
+        Dictionary with user details or None if error
+    """
+    headers = {
+        'Authorization': f'token {access_token}',
+        'Accept': 'application/vnd.github.v3+json'
+    }
+    
+    url = f'{REST_API_URL}/users/{username}'
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Warning: Could not fetch details for {username}: {response.status_code}")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching user details for {username}: {e}")
+        return None
 
 def create_empty_contribution_stats() -> Dict[str, int]:
     """Create an empty contribution statistics dictionary"""
@@ -101,9 +354,9 @@ def create_empty_contribution_stats() -> Dict[str, int]:
         'restricted': 0
     }
 
-def print_contribution_summary(email: str, stats: Dict[str, int]):
+def print_contribution_summary(username: str, stats: Dict[str, int]):
     """Print a detailed contribution summary for a user"""
-    print(f"\nContribution Summary for {email}:")
+    print(f"Contribution Summary for {username}:")
     print(f"  Total Contributions: {stats['total']}")
     print(f"  Code Commits: {stats['commits']}")
     print(f"  Issues: {stats['issues']}")
@@ -114,7 +367,7 @@ def print_contribution_summary(email: str, stats: Dict[str, int]):
     
     # Debug: Check if we're getting any non-zero values
     if all(value == 0 for value in stats.values()):
-        print(f"  ⚠️  WARNING: All contributions are zero for {email}")
+        print(f"  ⚠️  WARNING: All contributions are zero for {username}")
         print(f"     This might indicate: private repos, privacy settings, or date range issues")
 
 def write_to_file(file_handle, name: str, git_handle: str, email: str, stats: Dict[str, int]):
@@ -185,9 +438,6 @@ def extract_contribution_details(response_data: Dict[str, Any]) -> Dict[str, int
     try:
         contributions_collection = response_data["data"]["user"]["contributionsCollection"]
         
-        # Debug: Print raw API response for troubleshooting
-        print(f"Debug - Raw contribution data keys: {list(contributions_collection.keys())}")
-        
         stats = {
             'total': int(contributions_collection["contributionCalendar"]["totalContributions"]),
             'commits': int(contributions_collection.get("totalCommitContributions", 0)),
@@ -253,3 +503,4 @@ def get_detailed_repository_breakdown(
 
 if __name__ == "__main__":
     main()
+
